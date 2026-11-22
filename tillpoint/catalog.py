@@ -42,6 +42,13 @@ class Catalog:
             self._cache[sku] = product
         return product
 
+    def current_price(self, sku):
+        """Price straight from the DB. Orders use this: another worker may have changed it."""
+        row = self.conn.execute("SELECT price_cents FROM products WHERE sku = ?", (sku,)).fetchone()
+        if row is None:
+            raise UnknownProduct(sku)
+        return row["price_cents"]
+
     def update_price(self, sku, price_cents):
         if price_cents < 0:
             raise ValueError("price must not be negative")
@@ -52,11 +59,16 @@ class Catalog:
 
     def reserve(self, sku, qty):
         """Take qty units out of stock, or raise OutOfStock."""
-        product = self.get_product(sku)
-        if product.stock < qty:
-            raise OutOfStock(sku, qty, product.stock)
-        self.conn.execute("UPDATE products SET stock = stock - ? WHERE sku = ?", (qty, sku))
+        # One statement checks and takes the stock, so no other worker can slip in between,
+        # and the per-process cache is never consulted for this decision.
+        cur = self.conn.execute(
+            "UPDATE products SET stock = stock - ? WHERE sku = ? AND stock >= ?", (qty, sku, qty))
         self._cache.pop(sku, None)
+        if cur.rowcount == 0:
+            row = self.conn.execute("SELECT stock FROM products WHERE sku = ?", (sku,)).fetchone()
+            if row is None:
+                raise UnknownProduct(sku)
+            raise OutOfStock(sku, qty, row["stock"])
 
     def release(self, sku, qty):
         """Put qty units back into stock."""

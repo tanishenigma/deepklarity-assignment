@@ -21,7 +21,7 @@ class Orders:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             coupon = self._coupon(coupon_code)
-            priced = [(sku, qty, self.catalog.get_product(sku).price_cents) for sku, qty in items]
+            priced = [(sku, qty, self.catalog.current_price(sku)) for sku, qty in items]
             totals = pricing.price_order([(price, qty) for _, qty, price in priced], region, coupon)
             for sku, qty, _ in priced:
                 self.catalog.reserve(sku, qty)
