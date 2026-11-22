@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS payments (
     order_id INTEGER NOT NULL REFERENCES orders(id),
     event_id TEXT NOT NULL,
     amount_cents INTEGER NOT NULL,
+    credited_cents INTEGER NOT NULL DEFAULT 0,
     received_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);
@@ -53,7 +54,26 @@ def connect(path=":memory:"):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _add_credited_cents(conn)
     return conn
+
+
+def _add_credited_cents(conn):
+    """Databases made before overpayments existed lack payments.credited_cents. Everything they hold
+    was credited in full, so copy amount_cents across. The lock keeps two workers from both migrating."""
+    def missing():
+        return "credited_cents" not in {r["name"] for r in conn.execute("PRAGMA table_info(payments)")}
+    if not missing():
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if missing():
+            conn.execute("ALTER TABLE payments ADD COLUMN credited_cents INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE payments SET credited_cents = amount_cents")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def utcnow():

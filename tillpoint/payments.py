@@ -37,17 +37,31 @@ class Payments:
             return order["status"]
         if order["status"] == "cancelled":
             raise PaymentError(f"order {order['id']} is cancelled")
+        # Credit the order only up to what it still owes. Any excess is stored on the payment row
+        # (amount_cents - credited_cents), reported as an overpayment, and kept out of revenue.
+        already = self.paid_cents(order["id"])
+        credited = max(0, min(event["amount_cents"], order["total_cents"] - already))
         self.conn.execute(
-            "INSERT INTO payments (order_id, event_id, amount_cents, received_at) VALUES (?, ?, ?, ?)",
-            (order["id"], event["id"], event["amount_cents"], db.to_iso(now or db.utcnow())),
+            "INSERT INTO payments (order_id, event_id, amount_cents, credited_cents, received_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (order["id"], event["id"], event["amount_cents"], credited, db.to_iso(now or db.utcnow())),
         )
-        if order["status"] == "pending" and self.paid_cents(order["id"]) >= order["total_cents"]:
+        if order["status"] == "pending" and already + credited >= order["total_cents"]:
             self.conn.execute("UPDATE orders SET status = 'paid' WHERE id = ?", (order["id"],))
             return "paid"
         return order["status"]
 
     def paid_cents(self, order_id):
+        """Money credited to the order. Never more than its total."""
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(amount_cents), 0) AS paid FROM payments WHERE order_id = ?", (order_id,)
+            "SELECT COALESCE(SUM(credited_cents), 0) AS paid FROM payments WHERE order_id = ?", (order_id,)
         ).fetchone()
         return row["paid"]
+
+    def overpaid_cents(self, order_id):
+        """Money received beyond the order's total: held for a refund, not revenue."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount_cents - credited_cents), 0) AS over FROM payments WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        return row["over"]
