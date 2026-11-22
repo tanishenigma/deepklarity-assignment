@@ -14,9 +14,27 @@ class Payments:
         """event: dict(id, type, order_id, amount_cents). Returns the order's status after the event."""
         if event.get("type") != "payment.succeeded":
             return None
+        # The lock comes first so a retry handled by another worker at the same moment is seen below.
+        # The unique index on payments.event_id is the backstop if this ever runs without it.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            status = self._record(event, now)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return status
+
+    def _record(self, event, now):
         order = self.conn.execute("SELECT * FROM orders WHERE id = ?", (event["order_id"],)).fetchone()
         if order is None:
             raise PaymentError(f"payment for unknown order {event['order_id']}")
+        seen = self.conn.execute("SELECT * FROM payments WHERE event_id = ?", (event["id"],)).fetchone()
+        if seen is not None:
+            # A retry of an event we already took: answer as before, record nothing.
+            if seen["order_id"] != order["id"] or seen["amount_cents"] != event["amount_cents"]:
+                raise PaymentError(f"event {event['id']} was already recorded with different details")
+            return order["status"]
         if order["status"] == "cancelled":
             raise PaymentError(f"order {order['id']} is cancelled")
         self.conn.execute(
