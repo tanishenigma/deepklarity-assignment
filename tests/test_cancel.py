@@ -1,8 +1,11 @@
+import os
+import tempfile
+import threading
 import unittest
 
 from tillpoint import db
 from tillpoint.api import App
-from tillpoint.orders import OrderError
+from tillpoint.orders import OrderError, Orders
 
 
 class CancelRestockTest(unittest.TestCase):
@@ -42,6 +45,52 @@ class CancelRestockTest(unittest.TestCase):
         with self.assertRaises(OrderError):
             self.app.orders.cancel(order["id"])
         self.assertEqual(self.stock("MUG"), 7)
+
+
+class ConcurrentCancelTest(unittest.TestCase):
+    def test_two_workers_cancelling_one_order_release_stock_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cancel.db")
+            seed = db.connect(path)
+            seed.execute("INSERT INTO products (sku, name, price_cents, stock) VALUES ('MUG', 'Mug', 1200, 10)")
+            order = Orders(seed).create("ana", [("MUG", 3)])
+            seed.close()
+
+            gate = threading.Barrier(2)
+
+            class Gated(Orders):
+                """Pauses each worker's first order read so both see the order before either cancels it."""
+                first_read = True
+
+                def get(self, order_id):
+                    result = super().get(order_id)
+                    if self.first_read:
+                        self.first_read = False
+                        try:
+                            gate.wait(timeout=0.5)
+                        except threading.BrokenBarrierError:
+                            pass
+                    return result
+
+            def worker():
+                conn = db.connect(path)  # per-thread connection, closed by its own thread
+                try:
+                    Gated(conn).cancel(order["id"])
+                finally:
+                    conn.close()
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            check = db.connect(path)
+            stock = check.execute("SELECT stock FROM products WHERE sku = 'MUG'").fetchone()["stock"]
+            status = check.execute("SELECT status FROM orders WHERE id = ?", (order["id"],)).fetchone()["status"]
+            check.close()
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(stock, 10)
 
 
 if __name__ == "__main__":

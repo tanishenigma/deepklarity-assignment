@@ -46,19 +46,21 @@ class Orders:
 
     def cancel(self, order_id):
         """Cancel an order that has not shipped. Its stock and its coupon use go back."""
-        order = self.get(order_id)
-        if order["status"] == "cancelled":
-            return order
-        if order["status"] == "shipped":
-            raise OrderError("a shipped order cannot be cancelled")
+        # Take the write lock before reading the status: a read made before the lock can be
+        # stale by the time we hold it, and two workers would both release the same stock.
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            # Stock is taken when the order is created, so pending and paid orders both hold it.
-            for item in order["items"]:
-                self.catalog.release(item["sku"], item["qty"])
-            if order["coupon"]:
-                self.conn.execute("UPDATE coupons SET uses = uses - 1 WHERE code = ? AND uses > 0", (order["coupon"],))
-            self.conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,))
+            order = self.get(order_id)
+            if order["status"] == "shipped":
+                raise OrderError("a shipped order cannot be cancelled")
+            if order["status"] != "cancelled":
+                # Stock is taken when the order is created, so pending and paid orders both hold it.
+                for item in order["items"]:
+                    self.catalog.release(item["sku"], item["qty"])
+                if order["coupon"]:
+                    self.conn.execute(
+                        "UPDATE coupons SET uses = uses - 1 WHERE code = ? AND uses > 0", (order["coupon"],))
+                self.conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
